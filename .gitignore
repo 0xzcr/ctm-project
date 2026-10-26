@@ -1,0 +1,9 @@
+# setup.sh fetches the upstream CTM code here, at the pinned commit
+third_party/
+
+# Trained weights (43 MB) and training logs stay local; the per-run results (.json) are kept
+results/*.pt
+results/logs/
+
+__pycache__/
+.pytest_cache/
