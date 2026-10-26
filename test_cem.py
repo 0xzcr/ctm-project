@@ -5,6 +5,7 @@ Tests that the code does what the thesis says it does. Every test names the resu
 
 The clock, the sketch and the diary are tested on their own first, then the whole model, then the data.
 """
+import copy
 import hashlib
 import itertools
 import math
@@ -14,16 +15,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-from cem.clock import Clock
-from cem.memory import FOCUS, VALUE_SIZE, ClockedEventMemory, event_sync
+from cem.diary import FOCUS, VALUE_SIZE, Clock, Diary, SparseSketch, event_sync
 from cem.model import build_model
-from cem.sketch import SparseSketch
 from cem.task import MNIST_MEAN, MNIST_STD, PLUS, MNISTImages, sample_episodes
-from models.ctm_qamnist import ContinuousThoughtMachineQAMNIST  # noqa: E402  (upstream; importing cem put it on the path)
-from utils.losses import qamnist_loss  # noqa: E402  (upstream)
+from models.ctm_qamnist import ContinuousThoughtMachineQAMNIST  # upstream (importing cem put it on the path)
+from utils.losses import qamnist_loss  # upstream
 
 import train
-from verify import ABLATION_DIGITS, lost_accuracy, mass_by_gap, neighbour_share, silence, slip_chances
+from probe import ABLATION_DIGITS, lost_accuracy, mass_by_gap, neighbour_share, slip_chances
 
 # The sizes build_model() gives the diary
 N_PAIRS = 136              # 16 synchronised neurons -> 16 * 17 / 2 pairs
@@ -39,9 +38,9 @@ MARGIN = Clock().margin    # m_H of the design point
 # -------------------------------------------------------------------------------------------------------
 
 def diary_with_pages(n_pages: int, batch_size: int, dtype: torch.dtype = torch.float32,
-                     latest_head: bool = False) -> ClockedEventMemory:
+                     latest_head: bool = False) -> Diary:
     """A diary in which each of `batch_size` episodes has written `n_pages` random pages."""
-    diary = ClockedEventMemory(N_PAIRS, D_MODEL, D_INPUT, seed=0, latest_head=latest_head).to(dtype)
+    diary = Diary(N_PAIRS, D_MODEL, D_INPUT, seed=0, latest_head=latest_head).to(dtype)
     diary.reset(batch_size, torch.device("cpu"), dtype)
 
     generator = torch.Generator().manual_seed(0)
@@ -88,10 +87,7 @@ def lowest_grip_while_flipping(n_pages: int, direction: int) -> float:
 
     lowest_grip = 1.0
     for flips in range(1, n_pages):
-        if direction > 0:
-            _, light = diary.read_next(page_stamps)
-        else:
-            _, light = diary.read_previous(page_stamps)
+        _, light = diary.flip(direction, page_stamps)
 
         right_page = start_pages + direction * flips                # where each head should be now: (B,)
         exists = (right_page >= 0) & (right_page < n_pages)
@@ -177,7 +173,7 @@ def reference_answer(digits: list[int], tokens: list[int]) -> int:
 
 
 # -------------------------------------------------------------------------------------------------------
-# The clock (cem/clock.py)
+# The clock (cem/diary.py)
 # -------------------------------------------------------------------------------------------------------
 
 def test_the_clock_has_the_designed_margin():
@@ -221,7 +217,7 @@ def test_turning_the_hands_gives_the_stamp_of_another_page():
 
 
 # -------------------------------------------------------------------------------------------------------
-# The sketch (cem/sketch.py)
+# The sketch (cem/diary.py)
 # -------------------------------------------------------------------------------------------------------
 
 def test_a_sketch_has_a_fixed_number_of_units_on():
@@ -255,7 +251,7 @@ def test_sparse_sketches_separate_similar_inputs():
 
 
 # -------------------------------------------------------------------------------------------------------
-# The diary (cem/memory.py)
+# The diary (cem/diary.py)
 # -------------------------------------------------------------------------------------------------------
 
 def test_a_page_holds_exactly_its_event():
@@ -357,7 +353,7 @@ def test_flipping_pages_keeps_its_grip():
 def test_the_content_head_finds_the_page_that_looked_the_same():
     """Theorem 12(c): a cue that looks exactly like one event finds that event's page among 50."""
     n_pages = 50
-    diary = ClockedEventMemory(N_PAIRS, D_MODEL, D_INPUT, seed=0)
+    diary = Diary(N_PAIRS, D_MODEL, D_INPUT, seed=0)
     diary.reset(batch_size=n_pages, device=torch.device("cpu"), dtype=torch.float32)
 
     # Every episode writes the same 50 pages. Page p's event looked like looks[p].
@@ -450,7 +446,7 @@ def test_the_diary_changes_nothing_at_the_start():
 
 
 def test_with_images_the_diary_still_changes_nothing_at_the_start():
-    """Theorem 3(a) with real images: the upstream image backbone stays, and starts the same with or without the diary."""
+    """Theorem 3(a) with real images: the upstream backbone stays, and starts the same with or without the diary."""
     plain = build_model(use_diary=False, seed=0, images=True)
     with_diary = build_model(use_diary=True, seed=0, images=True)
     assert type(plain.backbone_digit).__name__ == "MNISTBackbone"
@@ -478,7 +474,7 @@ def test_both_variants_start_from_the_same_pretrained_backbone(tmp_path, monkeyp
     for use_diary in (False, True):
         model = build_model(use_diary=use_diary, seed=0, images=True)
         train.pretrain_backbone(model, images, images, seed=0, device="cpu")
-        backbones.append({name: weight.clone() for name, weight in model.backbone_digit.state_dict().items()})
+        backbones.append(copy.deepcopy(model.backbone_digit.state_dict()))    # a copy: later steps cannot change it
 
     for name, weight in backbones[0].items():
         assert torch.equal(weight, backbones[1][name]), name
@@ -575,39 +571,40 @@ def test_a_file_that_is_not_mnist_is_refused(tmp_path):
 
 
 # -------------------------------------------------------------------------------------------------------
-# The probes in verify.py
+# The probes in probe.py
 # -------------------------------------------------------------------------------------------------------
 
 def test_a_silenced_head_reads_nothing_until_it_is_restored():
-    """verify.py, ablations: a silenced head reads nothing and shines no light; removing the override restores it."""
+    """probe.py, ablations: a silenced head reads nothing and shines no light; un-silencing it restores it."""
     diary = diary_with_pages(n_pages=4, batch_size=2)
     seen = torch.randn(2, D_INPUT)
     read_before, _ = diary.read_by_content(seen)
 
-    silence(diary, "read_by_content")
+    diary.silenced = {"content"}
     read, light = diary.read_by_content(seen)
     assert torch.equal(read, torch.zeros(2, VALUE_SIZE))
     assert torch.equal(light, torch.zeros(2, 4))
 
-    delattr(diary, "read_by_content")
+    diary.silenced = set()
     read_after, _ = diary.read_by_content(seen)
     assert torch.equal(read_after, read_before)
 
 
 def test_lost_accuracy_is_counted_per_kind_of_question():
-    """verify.py, ablations: the accuracy a head carries, for pure recall and with operations, kept apart."""
+    """probe.py, ablations: the accuracy a head carries, for pure recall and with operations, kept apart."""
     with_every_head = {}
     without_next = {}
     for n_digits, n_ops in itertools.product(ABLATION_DIGITS, range(4)):
         with_every_head[f"{n_digits},{n_ops}"] = 0.9
         without_next[f"{n_digits},{n_ops}"] = 0.4 if n_ops == 0 else 0.9
-    per_seed = [{"none": with_every_head, "read_next": without_next}]
+    per_seed = [{"none": with_every_head, "next page": without_next}]
 
-    assert lost_accuracy(per_seed, "read_next", (0,)).tolist() == pytest.approx([0.5])
-    assert lost_accuracy(per_seed, "read_next", (1, 2, 3)).tolist() == pytest.approx([0.0])
+    assert lost_accuracy(per_seed, "next page", (0,)).tolist() == pytest.approx([0.5])
+    assert lost_accuracy(per_seed, "next page", (1, 2, 3)).tolist() == pytest.approx([0.0])
+
 
 def test_a_wrong_answer_is_shared_among_the_pages_that_hold_it():
-    """verify.py, prediction 3: a wrong answer lands, in equal shares, on every page that holds that digit."""
+    """probe.py, prediction 3: a wrong answer lands, in equal shares, on every page that holds that digit."""
     digits = np.array([[3, 7, 3, 5]])                                  # four pages
     asked_pages = np.array([1])                                         # the question asks for page 1, which holds 7
 
@@ -626,7 +623,7 @@ def test_a_wrong_answer_is_shared_among_the_pages_that_hold_it():
 
 
 def test_slips_never_land_on_the_asked_page():
-    """verify.py, Theorem 16: given a slip, the chances over pages add up to one and are 0 on the asked page."""
+    """probe.py, Theorem 16: given a slip, the chances over pages add up to one and are 0 on the asked page."""
     clock = Clock()
     trust = clock.trust.double().numpy()
     speeds = clock.speeds.double().numpy()

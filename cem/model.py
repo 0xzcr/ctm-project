@@ -1,59 +1,43 @@
 """
-The upstream Q&A-MNIST CTM with the diary attached (thesis Figure 1).
-
-Every tick does six things, in this order:
+The upstream Q&A-MNIST CTM with the diary attached (thesis Figure 1). Every tick does six things, in this order:
 
     1. LOOK       attention over the input, with a query from the synchronisation              (upstream)
-    2. READ       the four heads read the diary, and the read r_t is added to what was seen
+    2. READ       the heads read the diary, and the read r_t is added to what was seen
     3. THINK      the synapses mix what was seen with the neurons' latest outputs, then every
                   neuron passes its private history through its own tiny network               (upstream)
     4. CROSS OFF  the clock heads may edit the pages they are looking at
     5. WRITE      at the last tick of every event, one new page
     6. ANSWER     a prediction from the output synchronisation                                 (upstream)
 
-The steps marked (upstream) are the forward pass of the pinned upstream code, unchanged. With
-use_diary=False this class is exactly the upstream model, with one-hot digits instead of images (or, with
-images=True, with the upstream image backbone and real MNIST images).
+The upstream steps are the pinned upstream forward pass, unchanged. Without the diary this is exactly the upstream
+model, with one-hot digits instead of images (or, with images=True, the upstream image backbone and MNIST images).
 """
 import numpy as np
 import torch
 import torch.nn as nn
 
-from . import upstream  # noqa: F401  (puts the upstream code on the import path)
-from .memory import ClockedEventMemory, event_sync
-from models.ctm_qamnist import ContinuousThoughtMachineQAMNIST  # noqa: E402  (upstream)
+from .diary import Diary, event_sync
+from models.ctm_qamnist import ContinuousThoughtMachineQAMNIST  # upstream (importing cem put it on the path)
 
 
 class CTMWithDiary(ContinuousThoughtMachineQAMNIST):
 
     def __init__(self, *args, use_diary: bool = True, diary_seed: int = 0, latest_head: bool = False,
-                 images: bool = False, n_digit_classes: int = 10, **kwargs):
+                 images: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
 
-        # Digits arrive as one-hot vectors instead of images, which separates memory from perception
-        # (thesis Section 2.2). A 1x1 convolution turns each one-hot vector into the CTM's input features.
-        # With images=True the digits are real MNIST images, and the upstream image backbone stays.
+        # Digits arrive as one-hot vectors, which separates memory from perception (thesis Section 2.2); a 1x1
+        # convolution turns each one into the CTM's input features. With images=True the upstream backbone stays.
         if not images:
-            self.backbone_digit = nn.Conv2d(n_digit_classes, self.d_input, kernel_size=1)
+            self.backbone_digit = nn.Conv2d(10, self.d_input, kernel_size=1)
         self.backbone_frozen = False
 
+        self.diary = None
         if use_diary:
-            self.diary = ClockedEventMemory(
-                n_pairs=self.synch_representation_size_out,
-                d_model=self.d_model,
-                d_input=self.d_input,
-                seed=diary_seed,
-                latest_head=latest_head,
-            )
-        else:
-            self.diary = None
-
-    # ---------------------------------------------------------------------------------------------------
-    # A pretrained image backbone can be frozen (train.py --pretrain-backbone)
-    # ---------------------------------------------------------------------------------------------------
+            self.diary = Diary(self.synch_representation_size_out, self.d_model, self.d_input, diary_seed, latest_head)
 
     def freeze_backbone(self):
-        """Stop the image backbone from learning: its weights and its batch-norm statistics stay as they are."""
+        """Stop a pretrained image backbone from learning: its weights and batch-norm statistics stay as they are."""
         self.backbone_digit.requires_grad_(False)
         self.backbone_frozen = True
         self.backbone_digit.eval()
@@ -65,54 +49,11 @@ class CTMWithDiary(ContinuousThoughtMachineQAMNIST):
             self.backbone_digit.eval()
         return self
 
-    # ---------------------------------------------------------------------------------------------------
-    # Where the events are. The input marks them (assumption A1): every digit is shown for
-    # iterations_per_digit ticks and every part of the question for iterations_per_question_part ticks.
-    # ---------------------------------------------------------------------------------------------------
-
-    def is_last_tick_of_event(self, tick: int, digit_ticks: int, question_ticks: int) -> bool:
-        """True at the last tick of a digit or of a question part. The answer ticks show nothing: no event."""
-        if tick < digit_ticks:
-            ticks_into_digits = tick + 1
-            return ticks_into_digits % self.iterations_per_digit == 0
-
-        if tick < digit_ticks + question_ticks:
-            ticks_into_question = tick - digit_ticks + 1
-            return ticks_into_question % self.iterations_per_question_part == 0
-
-        return False
-
-    def event_length(self, tick: int, digit_ticks: int) -> int:
-        """R: how many ticks the event at this tick lasts."""
-        if tick < digit_ticks:
-            return self.iterations_per_digit
-        return self.iterations_per_question_part
-
-    def page_named_by_input(self, tick: int, digit_ticks: int, question_ticks: int, z: torch.Tensor):
-        """
-        The page an index token names at this tick (assumption A2), or None when no index token is shown.
-        The digits are the first events, so index token i ("digit i") names page i.
-        """
-        _, is_question, _ = self.determine_step_type(digit_ticks, question_ticks, tick)
-        if not is_question:
-            return None
-
-        is_index, _ = self.determine_index_operator_step_type(digit_ticks, tick)
-        if not is_index:
-            return None
-
-        return z[:, tick - digit_ticks]                                   # (B,) page numbers
-
-    # ---------------------------------------------------------------------------------------------------
-    # One episode
-    # ---------------------------------------------------------------------------------------------------
-
     def forward(self, x: torch.Tensor, z: torch.Tensor):
         """
-        x: (B, digit_ticks, 10, 1, 1)  one-hot digits, each repeated for the ticks it is shown
-                                       (or (B, digit_ticks, 1, 28, 28) images, with images=True)
-        z: (B, question_ticks)         question tokens: an index (0, 1, ...) or an operator (-1 plus, -2 minus)
-
+        x: (B, digit_ticks, 10, 1, 1) one-hot digits, each repeated for the ticks it is shown
+           (or (B, digit_ticks, 1, 28, 28) images)
+        z: (B, question_ticks) question tokens: an index (0, 1, ...) or an operator (-1 plus, -2 minus)
         returns predictions (B, 10, ticks), certainties (B, 2, ticks), and the last output synchronisation
         """
         batch_size = x.size(0)
@@ -135,8 +76,8 @@ class CTMWithDiary(ContinuousThoughtMachineQAMNIST):
         alpha_action, beta_action = None, None
         _, alpha_out, beta_out = self.compute_synchronisation(activated_state, None, None, fade_out, synch_type="out")
 
-        # --- The diary starts empty. Pages are made from the output tallies, the ones the CTM reads its
-        #     answers from, so remember them as they stand just before the first event begins. ---
+        # --- The diary starts empty. Pages are made from the output tallies, the ones the answers are read from, so
+        #     remember them as they stand just before the first event begins. ---
         if self.diary is not None:
             self.diary.reset(batch_size, device, x.dtype)
         alpha_before_event = alpha_out
@@ -145,7 +86,8 @@ class CTMWithDiary(ContinuousThoughtMachineQAMNIST):
         previous_input, previous_kv = None, None
         for tick in range(total_ticks):
             is_digit, is_question, is_answer = self.determine_step_type(digit_ticks, question_ticks, tick)
-            kv, previous_input = self.get_kv_for_step(digit_ticks, question_ticks, tick, x, z, previous_input, previous_kv)
+            kv, previous_input = self.get_kv_for_step(
+                digit_ticks, question_ticks, tick, x, z, previous_input, previous_kv)
             previous_kv = kv
 
             sync_action, alpha_action, beta_action = self.compute_synchronisation(
@@ -162,9 +104,11 @@ class CTMWithDiary(ContinuousThoughtMachineQAMNIST):
             # 2. READ the diary, and add what was read to what was seen
             view = seen
             if self.diary is not None:
-                named_page = self.page_named_by_input(tick, digit_ticks, question_ticks, z)
-                if named_page is not None:
-                    self.diary.open_at(named_page)
+                # An index token i ("digit i") names page i, because the digits are the first events (assumption A2).
+                if is_question:
+                    is_index, _ = self.determine_index_operator_step_type(digit_ticks, tick)
+                    if is_index:
+                        self.diary.open_at(z[:, tick - digit_ticks])
 
                 # The answer ticks show no input, so the content head has no cue on them.
                 cue = None if is_answer else seen
@@ -182,14 +126,18 @@ class CTMWithDiary(ContinuousThoughtMachineQAMNIST):
                 # 4. CROSS OFF, through the light of this tick's read
                 self.diary.cross_off(activated_state)
 
-                # 5. WRITE one page at the last tick of every event
-                if self.is_last_tick_of_event(tick, digit_ticks, question_ticks):
-                    event_length = self.event_length(tick, digit_ticks)
-                    u = event_sync(alpha_out, beta_out, alpha_before_event, beta_before_event, fade_out, event_length)
+                # 5. WRITE one page at the last tick of every event (assumption A1): every digit lasts
+                #    iterations_per_digit ticks and every question part iterations_per_question_part ticks.
+                if is_digit:
+                    event_ticks = self.iterations_per_digit
+                    ticks_so_far = tick + 1
+                else:
+                    event_ticks = self.iterations_per_question_part
+                    ticks_so_far = tick - digit_ticks + 1
+                if not is_answer and ticks_so_far % event_ticks == 0:
+                    u = event_sync(alpha_out, beta_out, alpha_before_event, beta_before_event, fade_out, event_ticks)
                     self.diary.write(u, seen)
-
-                    # The next event starts on the next tick.
-                    alpha_before_event = alpha_out
+                    alpha_before_event = alpha_out          # the next event starts on the next tick
                     beta_before_event = beta_out
 
             # 6. ANSWER (upstream)
@@ -205,10 +153,9 @@ def build_model(use_diary: bool = True, seed: int = 0, ticks_per_item: int = 3, 
     """
     The Q&A-MNIST CTM of our earlier experiments (the "CTM" row of thesis Box 1), with or without the diary.
 
-    `seed` fixes the CTM's initial weights and its choice of synchronised neuron pairs. The diary draws its
-    own random numbers, so with the same seed both variants start from exactly the same CTM.
-    `d_model` sizes the plain CTM up to the diary's number of parameters (107 neurons: 51,164 against 50,925).
-    `latest_head` gives the diary its optional fifth head, and `images` shows real MNIST images.
+    `seed` fixes the CTM's initial weights and its choice of synchronised neuron pairs. The diary draws its own random
+    numbers, so with the same seed both variants start from exactly the same CTM. `d_model` sizes the plain CTM up to
+    the diary's number of parameters (107 neurons: 51,164 against 50,925).
     """
     torch.manual_seed(seed)
     np.random.seed(seed)            # upstream picks the synchronised neuron pairs with numpy's global generator
@@ -236,25 +183,18 @@ def build_model(use_diary: bool = True, seed: int = 0, ticks_per_item: int = 3, 
         latest_head=latest_head,
         images=images,
     )
-    create_lazy_weights(model, ticks_per_item, images)
-    return model
 
-
-def create_lazy_weights(model: CTMWithDiary, ticks_per_item: int, images: bool = False):
-    """
-    The upstream CTM creates some of its layers lazily, on its first forward pass. Run one tiny episode
-    (the digit 0, or a blank image, then the question "index 0") so that every weight exists before an
-    optimiser is made.
-    """
+    # The upstream CTM creates some layers lazily, on its first forward pass. One tiny episode (the digit 0, or a blank
+    # image, then the question "index 0") creates every weight before an optimiser is made. It runs in eval mode, so
+    # that the image backbone's batch norm does not learn from it.
     if images:
         one_digit = torch.zeros(1, ticks_per_item, 1, 28, 28)
     else:
         one_digit = torch.zeros(1, ticks_per_item, 10, 1, 1)
         one_digit[:, :, 0] = 1.0
     question = torch.zeros(1, ticks_per_item, dtype=torch.long)
-
-    # In eval mode, so that the image backbone's batch norm does not learn from this made-up episode.
     model.eval()
     with torch.no_grad():
         model(one_digit, question)
     model.train()
+    return model
